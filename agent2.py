@@ -7,7 +7,7 @@ Features:
 - Executes rules across all entities (Excel sheets)
 - Generates per-entity issues CSVs and a combined issues CSV
 - Converts profiling JSON to per-entity profile CSVs and a summary CSV
-- Produces remediation suggestions using local Ollama (DeepSeek R1), with caching and fallbacks
+- Produces remediation suggestions using Groq Chat Completions API, with caching and fallbacks
 
 Inputs (defaults, override via CLI):
 - --excel outputs/input.xlsx             (path to Excel data)
@@ -23,7 +23,7 @@ Outputs:
 
 Note:
 - This script does not require CrewAI; it runs standalone.
-- Remediation suggestions use Ollama at http://localhost:11434 with model 'deepseek-r1'.
+- Remediation suggestions use Groq at https://api.groq.com/openai/v1/chat/completions by default.
 """
 from __future__ import annotations
 
@@ -228,19 +228,25 @@ def load_rules_from_yaml(rules_path: str) -> List[Rule]:
 # ------------------------------- LLM Remediation ------------------------------ #
 
 class RemediationLLM:
+    """LLM client for remediation suggestions using Groq Chat Completions API."""
+
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
-        model: str = "deepseek-r1",
+        groq_api_key: Optional[str],
+        model: str = "llama-3.1-8b-instant",
         temperature: float = 0.2,
         timeout_sec: int = 30,
         cache_path: Optional[str] = None,
+        base_url: str = "https://api.groq.com/openai/v1",
+        max_tokens: int = 120,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.groq_api_key = groq_api_key
         self.model = model
         self.temperature = temperature
         self.timeout_sec = timeout_sec
         self.cache_path = cache_path
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = max_tokens
         self.cache: Dict[str, str] = {}
         if cache_path and os.path.exists(cache_path):
             try:
@@ -263,29 +269,47 @@ class RemediationLLM:
         if prompt_key in self.cache:
             return self.cache[prompt_key]
 
+        if not self.groq_api_key:
+            # No key available: fallback
+            suggestion = "Review source process and correct the value to meet the rule criteria."
+            self.cache[prompt_key] = suggestion
+            self._save_cache()
+            return suggestion
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
         payload = {
             "model": self.model,
-            "prompt": prompt_text,
-            "stream": False,
-            "options": {
-                "temperature": self.temperature,
-            },
-            # Provide a system instruction for consistency (supported by /api/generate)
-            "system": (
-                "You are a pharmaceutical data quality remediation expert. "
-                "Provide concise, specific, action-oriented fixes that respect GMP and FDA guidance. "
-                "Tailor the suggestion to the rule type and column domain. "
-                "Prefer operational actions (e.g., recalibrate instrument, update master data, correct mapping). "
-                "Do NOT change the data or propose generic messages."
-            ),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a pharmaceutical data quality remediation expert. "
+                        "Provide concise, specific, action-oriented fixes that respect GMP and FDA guidance. "
+                        "Tailor the suggestion to the rule type and column domain. "
+                        "Prefer operational actions (e.g., recalibrate instrument, update master data, correct mapping). "
+                        "Do NOT change the data or propose generic messages."
+                    ),
+                },
+                {"role": "user", "content": prompt_text},
+            ],
         }
-        url = f"{self.base_url}/api/generate"
 
         try:
-            resp = requests.post(url, json=payload, timeout=self.timeout_sec)
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
             resp.raise_for_status()
             data = resp.json()
-            suggestion = (data.get("response") or "").strip()
+            suggestion = (
+                (data.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
             if not suggestion:
                 raise ValueError("Empty response from LLM")
         except Exception:
@@ -1092,8 +1116,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--profiling", default="outputs/profiling_results.json", help="Path to profiling JSON from Agent 1")
     parser.add_argument("--output", default="outputs", help="Output directory")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM remediation suggestions")
-    parser.add_argument("--ollama-model", default="deepseek-r1", help="Ollama model name (default: deepseek-r1)")
-    parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--groq-model", default="llama-3.1-8b-instant", help="Groq model (default: llama-3.1-8b-instant)")
+    parser.add_argument("--groq-api-key", default=None, help="Groq API key (fallback to env GROQ_API_KEY)")
     parser.add_argument("--timeout", type=int, default=30, help="LLM timeout seconds")
 
     args = parser.parse_args(argv)
@@ -1143,14 +1167,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     remediation_llm: Optional[RemediationLLM] = None
     if not args.no_llm:
         cache_path = os.path.join(output_dir, "remediation_cache.json")
+        groq_api_key = args.groq_api_key or os.getenv("GROQ_API_KEY")
         remediation_llm = RemediationLLM(
-            base_url=args.ollama_url,
-            model=args.ollama_model,
+            groq_api_key=groq_api_key,
+            model=args.groq_model,
             temperature=0.2,
             timeout_sec=args.timeout,
             cache_path=cache_path,
         )
-        print(f"   ✓ Remediation LLM via Ollama: {args.ollama_model}")
+        if groq_api_key:
+            print(f"   ✓ Remediation LLM via Groq model: {args.groq_model}")
+        else:
+            print("   ⚠️ GROQ_API_KEY not set; using fallback static remediation text")
     else:
         print("   ✓ LLM remediation disabled by flag --no-llm")
 
