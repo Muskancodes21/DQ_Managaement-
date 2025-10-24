@@ -34,6 +34,8 @@ import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+import time
+import random
 
 import pandas as pd
 import numpy as np
@@ -228,7 +230,14 @@ def load_rules_from_yaml(rules_path: str) -> List[Rule]:
 # ------------------------------- LLM Remediation ------------------------------ #
 
 class RemediationLLM:
-    """LLM client for remediation suggestions using Groq Chat Completions API."""
+    """LLM client for remediation suggestions using Groq Chat Completions API.
+
+    Includes:
+    - Local cache keyed by constraint signature
+    - Severity gating (only call LLM for >= threshold)
+    - Per-run call budget to avoid rate limits
+    - Exponential backoff with Retry-After parsing on 429
+    """
 
     def __init__(
         self,
@@ -239,6 +248,9 @@ class RemediationLLM:
         cache_path: Optional[str] = None,
         base_url: str = "https://api.groq.com/openai/v1",
         max_tokens: int = 120,
+        severity_threshold: str = "HIGH",
+        max_calls_per_run: int = 50,
+        max_retries: int = 3,
     ) -> None:
         self.groq_api_key = groq_api_key
         self.model = model
@@ -247,6 +259,11 @@ class RemediationLLM:
         self.cache_path = cache_path
         self.base_url = base_url.rstrip("/")
         self.max_tokens = max_tokens
+        self.severity_threshold = _normalize_severity(severity_threshold)
+        self.severity_threshold_order = SEVERITY_ORDER.get(self.severity_threshold, 1)
+        self.max_calls_per_run = max_calls_per_run
+        self.max_retries = max_retries
+        self.calls_made = 0
         self.cache: Dict[str, str] = {}
         if cache_path and os.path.exists(cache_path):
             try:
@@ -265,13 +282,27 @@ class RemediationLLM:
         except Exception:
             pass
 
-    def suggest(self, prompt_key: str, prompt_text: str) -> str:
+    def _allowed_for_severity(self, severity: str) -> bool:
+        sev = _normalize_severity(severity)
+        return SEVERITY_ORDER.get(sev, 99) <= self.severity_threshold_order
+
+    def _have_budget(self) -> bool:
+        return self.calls_made < self.max_calls_per_run
+
+    def suggest(self, prompt_key: str, prompt_text: str, severity: str) -> str:
+        # Use cache first without budget checks
         if prompt_key in self.cache:
             return self.cache[prompt_key]
 
+        # Respect severity threshold and per-run budget
+        if not self._allowed_for_severity(severity) or not self._have_budget():
+            suggestion = default_fallback_suggestion()
+            self.cache[prompt_key] = suggestion
+            self._save_cache()
+            return suggestion
+
         if not self.groq_api_key:
-            # No key available: fallback
-            suggestion = "Review source process and correct the value to meet the rule criteria."
+            suggestion = default_fallback_suggestion()
             self.cache[prompt_key] = suggestion
             self._save_cache()
             return suggestion
@@ -300,26 +331,69 @@ class RemediationLLM:
             ],
         }
 
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
-            resp.raise_for_status()
-            data = resp.json()
-            suggestion = (
-                (data.get("choices") or [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-            if not suggestion:
-                raise ValueError("Empty response from LLM")
-        except Exception:
-            # Fallback minimal heuristic message
-            suggestion = "Review source process and correct the value to meet the rule criteria."
+        self.calls_made += 1
 
-        # Cache and persist
+        last_err: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
+                if resp.status_code == 429:
+                    # Rate limited: compute wait and retry
+                    wait_s = self._parse_retry_after(resp) or self._parse_seconds_from_error(resp) or self._compute_backoff(attempt)
+                    time.sleep(wait_s)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                suggestion = (
+                    (data.get("choices") or [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+                if not suggestion:
+                    raise ValueError("Empty response from LLM")
+                # Cache and persist
+                self.cache[prompt_key] = suggestion
+                self._save_cache()
+                return suggestion
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                # Backoff and retry
+                wait_s = self._compute_backoff(attempt)
+                time.sleep(wait_s)
+                continue
+
+        # Fallback minimal heuristic message
+        suggestion = default_fallback_suggestion()
         self.cache[prompt_key] = suggestion
         self._save_cache()
         return suggestion
+
+    def _parse_retry_after(self, resp: requests.Response) -> Optional[float]:
+        try:
+            ra = resp.headers.get("Retry-After")
+            if not ra:
+                return None
+            return float(ra)
+        except Exception:
+            return None
+
+    def _parse_seconds_from_error(self, resp: requests.Response) -> Optional[float]:
+        try:
+            data = resp.json()
+            msg = (data.get("error", {}).get("message") or "").lower()
+            m = re.search(r"try again in\s+([0-9]+\.?[0-9]*)s", msg)
+            if m:
+                return float(m.group(1))
+        except Exception:
+            return None
+        return None
+
+    def _compute_backoff(self, attempt: int) -> float:
+        base = 3.0
+        cap = 20.0
+        jitter = random.uniform(0, 1.0)
+        return min(cap, base * (2 ** attempt)) + jitter
 
 
 def build_remediation_prompt(
@@ -744,7 +818,7 @@ def _maybe_remediate(remediation_llm: Optional[RemediationLLM], issue: Dict[str,
         expected_value=issue.get("expected_value"),
         severity=str(issue.get("severity")),
     )
-    return remediation_llm.suggest(prompt_key, prompt_text)
+    return remediation_llm.suggest(prompt_key, prompt_text, severity=str(issue.get("severity")))
 
 
 # --------------------------- Profiling JSON Conversion ------------------------ #
@@ -1118,6 +1192,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM remediation suggestions")
     parser.add_argument("--groq-model", default="llama-3.1-8b-instant", help="Groq model (default: llama-3.1-8b-instant)")
     parser.add_argument("--groq-api-key", default=None, help="Groq API key (fallback to env GROQ_API_KEY)")
+    parser.add_argument("--llm-severity-threshold", default="HIGH", help="Min severity for LLM calls: CRITICAL|HIGH|MEDIUM|LOW")
+    parser.add_argument("--llm-max-calls", type=int, default=50, help="Max Groq calls per run to avoid rate limits")
     parser.add_argument("--timeout", type=int, default=30, help="LLM timeout seconds")
 
     args = parser.parse_args(argv)
@@ -1174,6 +1250,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             temperature=0.2,
             timeout_sec=args.timeout,
             cache_path=cache_path,
+            severity_threshold=args.llm_severity_threshold,
+            max_calls_per_run=args.llm_max_calls,
         )
         if groq_api_key:
             print(f"   ✓ Remediation LLM via Groq model: {args.groq_model}")
