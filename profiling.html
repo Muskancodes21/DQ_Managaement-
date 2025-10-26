@@ -1,0 +1,233 @@
+{% extends "base.html" %}
+
+{% block title %}Profiling - DQ Dashboard{% endblock %}
+
+{% block extra_css %}
+<style>
+    .entity-selector {
+        margin-bottom: 30px;
+    }
+    
+    .entity-selector select {
+        padding: 12px 20px;
+        font-size: 1.1em;
+        border: 2px solid #667eea;
+        border-radius: 8px;
+        width: 300px;
+        cursor: pointer;
+    }
+    
+    .entity-info {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin-bottom: 30px;
+    }
+    
+    .info-box {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 8px;
+        text-align: center;
+    }
+    
+    .info-box h3 {
+        font-size: 2.5em;
+        margin-bottom: 5px;
+    }
+    
+    .columns-table {
+        width: 100%;
+        margin-top: 20px;
+    }
+    
+    .columns-table th {
+        background: #667eea;
+        color: white;
+        padding: 12px;
+        text-align: left;
+    }
+    
+    .columns-table td {
+        padding: 12px;
+        border-bottom: 1px solid #e0e0e0;
+    }
+    
+    .columns-table tr:hover {
+        background: #f8f9fa;
+    }
+    
+    .progress-bar {
+        width: 100%;
+        height: 20px;
+        background: #e0e0e0;
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #27ae60 0%, #2ecc71 100%);
+        transition: width 0.3s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 0.85em;
+        font-weight: bold;
+    }
+    
+    .column-details {
+        font-size: 0.9em;
+        color: #7f8c8d;
+        margin-top: 5px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>📈 Data Profiling</h1>
+    <p>Detailed column-level statistics and data quality metrics</p>
+</div>
+
+<!-- Entity Selector -->
+<div class="card">
+    <div class="entity-selector">
+        <label for="entity-select" style="font-size: 1.1em; font-weight: 600; margin-right: 15px;">
+            Select Entity:
+        </label>
+        <select id="entity-select" onchange="loadEntityProfile(this.value)">
+            <option value="">-- Choose an entity --</option>
+            {% for entity in entities %}
+            <option value="{{ entity }}">{{ entity }}</option>
+            {% endfor %}
+        </select>
+    </div>
+</div>
+
+<!-- Entity Info -->
+<div id="entity-info" style="display: none;">
+    <div class="entity-info">
+        <div class="info-box">
+            <h3 id="row-count">-</h3>
+            <p>Total Rows</p>
+        </div>
+        <div class="info-box">
+            <h3 id="column-count">-</h3>
+            <p>Total Columns</p>
+        </div>
+    </div>
+</div>
+
+<!-- Columns Table -->
+<div id="columns-container" style="display: none;">
+    <div class="card">
+        <h2>Column Statistics</h2>
+        <table class="columns-table" id="columns-table">
+            <thead>
+                <tr>
+                    <th>Column Name</th>
+                    <th>Data Type</th>
+                    <th>Completeness</th>
+                    <th>Distinct Values</th>
+                    <th>Null Count</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody id="columns-tbody">
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    async function loadEntityProfile(entityName) {
+        if (!entityName) {
+            document.getElementById('entity-info').style.display = 'none';
+            document.getElementById('columns-container').style.display = 'none';
+            return;
+        }
+        
+        try {
+            showLoading('columns-tbody');
+            
+            const response = await fetch(`/api/profiling/${entityName}`);
+            const data = await response.json();
+            
+            if (data.error) {
+                alert('Error: ' + data.error);
+                return;
+            }
+            
+            // Update entity info
+            document.getElementById('row-count').textContent = data.row_count.toLocaleString();
+            document.getElementById('column-count').textContent = data.column_count;
+            document.getElementById('entity-info').style.display = 'block';
+            
+            // Render columns table
+            renderColumnsTable(data.columns);
+            document.getElementById('columns-container').style.display = 'block';
+            
+        } catch (error) {
+            alert('Failed to load profile: ' + error.message);
+        }
+    }
+    
+    function renderColumnsTable(columns) {
+        const tbody = document.getElementById('columns-tbody');
+        tbody.innerHTML = '';
+        
+        columns.forEach(col => {
+            const row = document.createElement('tr');
+            
+            // Completeness color
+            let completenessColor = '#27ae60';
+            if (col.completeness_score < 90) completenessColor = '#f39c12';
+            if (col.completeness_score < 70) completenessColor = '#e74c3c';
+            
+            row.innerHTML = `
+                <td><strong>${col.name}</strong></td>
+                <td><code>${col.data_type}</code></td>
+                <td>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: ${col.completeness_score}%; background: ${completenessColor};">
+                            ${col.completeness_score.toFixed(1)}%
+                        </div>
+                    </div>
+                </td>
+                <td>${col.distinct_count.toLocaleString()} <span style="color: #7f8c8d;">(${(col.cardinality_ratio * 100).toFixed(1)}%)</span></td>
+                <td style="color: ${col.null_count > 0 ? '#e74c3c' : '#27ae60'};">${col.null_count.toLocaleString()}</td>
+                <td>
+                    <div class="column-details">
+                        ${col.min !== null ? `Min: ${col.min}<br>` : ''}
+                        ${col.max !== null ? `Max: ${col.max}<br>` : ''}
+                        ${col.mean !== null ? `Mean: ${col.mean.toFixed(2)}<br>` : ''}
+                        ${col.pattern ? `Pattern: <code>${col.pattern}</code>` : ''}
+                    </div>
+                </td>
+            `;
+            
+            tbody.appendChild(row);
+        });
+    }
+    
+    // Auto-load first entity if available
+    window.onload = function() {
+        const select = document.getElementById('entity-select');
+        const urlParams = new URLSearchParams(window.location.search);
+        const entityParam = urlParams.get('entity');
+        
+        if (entityParam) {
+            select.value = entityParam;
+            loadEntityProfile(entityParam);
+        } else if (select.options.length > 1) {
+            select.selectedIndex = 1;
+            loadEntityProfile(select.value);
+        }
+    };
+</script>
+{% endblock %}
