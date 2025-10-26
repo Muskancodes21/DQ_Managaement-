@@ -1,0 +1,532 @@
+"""
+Main Data Quality Dashboard - FIXED VERSION
+Properly loads and displays all data from Agent outputs
+"""
+ 
+import os
+import json
+import pandas as pd
+from pathlib import Path
+from flask import Flask, render_template, jsonify, request, send_file
+from datetime import datetime
+ 
+# Import Agent 3 (remediation service)
+import sys
+sys.path.append(str(Path(__file__).parent.parent))
+
+# Try to import Agent3, but don't fail if it's not available
+try:
+    from agents.agent3 import RemediationService
+    AGENT3_AVAILABLE = True
+except ImportError:
+    AGENT3_AVAILABLE = False
+    print("⚠️  Agent3 not available - remediation features disabled")
+ 
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+ 
+# Configuration
+OUTPUT_DIR = Path("outputs")
+DATASET_PATH = Path(r"D:\Muskan.Verma_OneDrive_Data\OneDrive - Course5 Intelligence Limited\Desktop\Pharma Dataset\pharmaceutical_manufacturing_with_dq_issues.xlsx")
+GROQ_API_KEY = "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"
+ 
+# Initialize remediation service
+if AGENT3_AVAILABLE:
+    os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+    try:
+        remediation_service = RemediationService(OUTPUT_DIR, DATASET_PATH)
+        print("✓ Remediation service initialized")
+    except Exception as e:
+        remediation_service = None
+        print(f"⚠️  Could not initialize remediation service: {e}")
+else:
+    remediation_service = None
+ 
+ 
+# ==================== HELPER FUNCTIONS ====================
+ 
+def load_profiling_data():
+    """Load profiling results with error handling"""
+    profiling_file = OUTPUT_DIR / "profiling_results.json"
+    
+    if not profiling_file.exists():
+        print(f"❌ Profiling file not found: {profiling_file}")
+        return None
+    
+    try:
+        with open(profiling_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print(f"✓ Loaded profiling data: {len(data.get('entities', {}))} entities")
+        return data
+    except Exception as e:
+        print(f"❌ Error loading profiling data: {e}")
+        return None
+ 
+def load_issues_data():
+    """Load quality issues with error handling"""
+    issues_file = OUTPUT_DIR / "quality_issues_with_remediation.csv"
+    
+    if not issues_file.exists():
+        print(f"❌ Issues file not found: {issues_file}")
+        return None
+    
+    try:
+        df = pd.read_csv(issues_file)
+        
+        # Ensure required columns exist
+        required_cols = ['entity', 'column', 'rule_violated', 'severity']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            print(f"⚠️  Missing columns in issues file: {missing_cols}")
+            print(f"   Available columns: {list(df.columns)}")
+            # Try to add missing columns with defaults
+            for col in missing_cols:
+                if col == 'severity':
+                    df['severity'] = 'MEDIUM'
+                else:
+                    df[col] = 'Unknown'
+        
+        print(f"✓ Loaded issues data: {len(df)} issues")
+        print(f"  Columns: {list(df.columns)}")
+        
+        # Print severity breakdown
+        if 'severity' in df.columns:
+            severity_counts = df['severity'].value_counts().to_dict()
+            print(f"  Severity breakdown: {severity_counts}")
+        
+        return df
+        
+    except Exception as e:
+        print(f"❌ Error loading issues data: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def calculate_overall_health():
+    """Calculate overall data quality score"""
+    issues_df = load_issues_data()
+    profiling_data = load_profiling_data()
+   
+    if issues_df is None or profiling_data is None:
+        return 0
+   
+    # Calculate based on issues severity
+    total_cells = 0
+    entities = profiling_data.get('entities', {})
+   
+    for entity_name, entity_data in entities.items():
+        rows = entity_data.get('row_count', 0)
+        cols = entity_data.get('column_count', 0)
+        total_cells += (rows * cols)
+   
+    if total_cells == 0:
+        return 100
+   
+    # Weight issues by severity
+    severity_weights = {'CRITICAL': 3, 'HIGH': 2, 'MEDIUM': 1, 'LOW': 0.5}
+    weighted_issues = 0
+   
+    for _, row in issues_df.iterrows():
+        severity = str(row.get('severity', 'MEDIUM')).upper()
+        weight = severity_weights.get(severity, 1)
+        weighted_issues += weight
+   
+    # Calculate health score (100 - issue impact)
+    issue_impact = min((weighted_issues / total_cells) * 1000, 100)
+    health_score = max(100 - issue_impact, 0)
+   
+    return round(health_score, 1)
+ 
+ 
+# ==================== ROUTES ====================
+ 
+@app.route('/')
+def overview():
+    """Main overview page"""
+    try:
+        profiling_data = load_profiling_data()
+        issues_df = load_issues_data()
+       
+        if profiling_data is None or issues_df is None:
+            error_msg = []
+            if profiling_data is None:
+                error_msg.append("Profiling data not found (run Agent 1)")
+            if issues_df is None:
+                error_msg.append("Issues data not found (run Agent 2)")
+            
+            return render_template('error.html',
+                message=" and ".join(error_msg) + ". Please run the missing agents first.")
+       
+        # Calculate metrics
+        overall_health = calculate_overall_health()
+        total_entities = len(profiling_data.get('entities', {}))
+        total_issues = len(issues_df)
+       
+        # Count by severity - handle missing or inconsistent severity values
+        severity_counts = {}
+        if 'severity' in issues_df.columns:
+            # Normalize severity values to uppercase
+            issues_df['severity'] = issues_df['severity'].astype(str).str.upper()
+            severity_counts = issues_df['severity'].value_counts().to_dict()
+        else:
+            severity_counts = {'MEDIUM': total_issues}
+        
+        # Ensure all severity levels are present
+        for level in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+            if level not in severity_counts:
+                severity_counts[level] = 0
+       
+        # Entity health scores
+        entity_health = []
+        for entity_name, entity_data in profiling_data.get('entities', {}).items():
+            entity_issues = issues_df[issues_df['entity'] == entity_name]
+            entity_issue_count = len(entity_issues)
+           
+            # Simple health calculation
+            total_cols = entity_data.get('column_count', 1)
+            rows = entity_data.get('row_count', 0)
+            health = max(100 - (entity_issue_count / max(total_cols, 1) * 10), 0)
+           
+            entity_health.append({
+                'name': entity_name,
+                'health': round(health, 1),
+                'issues': entity_issue_count,
+                'rows': rows,
+                'columns': total_cols
+            })
+       
+        print(f"✓ Rendering overview: {total_entities} entities, {total_issues} issues")
+        print(f"  Severity counts: {severity_counts}")
+        
+        return render_template('overview.html',
+            overall_health=overall_health,
+            total_entities=total_entities,
+            total_issues=total_issues,
+            severity_counts=severity_counts,
+            entity_health=entity_health
+        )
+    
+    except Exception as e:
+        print(f"❌ Error in overview route: {e}")
+        import traceback
+        traceback.print_exc()
+        return render_template('error.html',
+            message=f"Error loading overview: {str(e)}")
+ 
+ 
+@app.route('/profiling')
+def profiling():
+    """Profiling page - view entity and column statistics"""
+    try:
+        profiling_data = load_profiling_data()
+       
+        if profiling_data is None:
+            return render_template('error.html',
+                message="No profiling data found. Please run Agent 1 first.")
+       
+        entities = list(profiling_data.get('entities', {}).keys())
+       
+        print(f"✓ Rendering profiling page: {len(entities)} entities")
+        
+        return render_template('profiling.html', entities=entities)
+    
+    except Exception as e:
+        print(f"❌ Error in profiling route: {e}")
+        import traceback
+        traceback.print_exc()
+        return render_template('error.html',
+            message=f"Error loading profiling: {str(e)}")
+ 
+ 
+@app.route('/api/profiling/<entity>')
+def get_entity_profile(entity):
+    """API endpoint to get profile for specific entity"""
+    try:
+        profiling_data = load_profiling_data()
+       
+        if profiling_data is None:
+            return jsonify({'error': 'No profiling data found'}), 404
+       
+        entity_data = profiling_data.get('entities', {}).get(entity)
+       
+        if entity_data is None:
+            return jsonify({'error': f'Entity {entity} not found'}), 404
+       
+        # Format column data for frontend
+        columns = []
+        for col_name, col_stats in entity_data.get('columns', {}).items():
+            columns.append({
+                'name': col_name,
+                'data_type': col_stats.get('data_type', 'Unknown'),
+                'total_values': col_stats.get('total_values', 0),
+                'null_count': col_stats.get('null_count', 0),
+                'null_percentage': col_stats.get('null_percentage', 0),
+                'completeness_score': col_stats.get('completeness_score', 100),
+                'distinct_count': col_stats.get('distinct_count', 0),
+                'cardinality_ratio': col_stats.get('cardinality_ratio', 0),
+                'min': col_stats.get('min'),
+                'max': col_stats.get('max'),
+                'mean': col_stats.get('mean'),
+                'median': col_stats.get('median'),
+                'pattern': col_stats.get('pattern'),
+                'top_values': col_stats.get('top_values', {})
+            })
+       
+        return jsonify({
+            'entity': entity,
+            'row_count': entity_data.get('row_count', 0),
+            'column_count': entity_data.get('column_count', 0),
+            'columns': columns
+        })
+    
+    except Exception as e:
+        print(f"❌ Error in get_entity_profile: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+ 
+ 
+@app.route('/issues')
+def issues():
+    """Issues explorer page"""
+    try:
+        issues_df = load_issues_data()
+       
+        if issues_df is None:
+            return render_template('error.html',
+                message="No issues data found. Please run Agent 2 first.")
+       
+        # Get unique values for filters - with error handling
+        entities = sorted(issues_df['entity'].unique().tolist()) if 'entity' in issues_df.columns else []
+        
+        # Normalize severity values
+        if 'severity' in issues_df.columns:
+            issues_df['severity'] = issues_df['severity'].astype(str).str.upper()
+            severities = sorted(issues_df['severity'].unique().tolist())
+        else:
+            severities = []
+        
+        rule_types = sorted(issues_df['rule_violated'].unique().tolist()) if 'rule_violated' in issues_df.columns else []
+       
+        print(f"✓ Rendering issues page: {len(entities)} entities, {len(severities)} severities")
+        
+        return render_template('issues.html',
+            entities=entities,
+            severities=severities,
+            rule_types=rule_types
+        )
+    
+    except Exception as e:
+        print(f"❌ Error in issues route: {e}")
+        import traceback
+        traceback.print_exc()
+        return render_template('error.html',
+            message=f"Error loading issues: {str(e)}")
+ 
+ 
+@app.route('/api/issues')
+def get_issues():
+    """API endpoint to get filtered issues"""
+    try:
+        issues_df = load_issues_data()
+       
+        if issues_df is None:
+            return jsonify({'error': 'No issues data found'}), 404
+       
+        # Normalize severity
+        if 'severity' in issues_df.columns:
+            issues_df['severity'] = issues_df['severity'].astype(str).str.upper()
+        
+        # Apply filters
+        entity = request.args.get('entity')
+        severity = request.args.get('severity', '').upper() if request.args.get('severity') else None
+        rule_type = request.args.get('rule_type')
+        search = request.args.get('search', '').lower()
+       
+        filtered_df = issues_df.copy()
+       
+        if entity and 'entity' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['entity'] == entity]
+       
+        if severity and 'severity' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['severity'] == severity]
+       
+        if rule_type and 'rule_violated' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['rule_violated'] == rule_type]
+       
+        if search:
+            # Search in multiple columns
+            mask = pd.Series([False] * len(filtered_df))
+            for col in ['entity', 'column', 'rule_violated', 'value']:
+                if col in filtered_df.columns:
+                    mask |= filtered_df[col].astype(str).str.lower().str.contains(search, na=False)
+            filtered_df = filtered_df[mask]
+       
+        # Convert to JSON - handle NaN values
+        issues_list = filtered_df.fillna('').to_dict('records')
+       
+        print(f"✓ API /api/issues: returning {len(issues_list)} issues")
+        
+        return jsonify({
+            'total': len(issues_list),
+            'issues': issues_list
+        })
+    
+    except Exception as e:
+        print(f"❌ Error in get_issues API: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+ 
+ 
+@app.route('/remediation')
+def remediation():
+    """Remediation page - AI-powered issue fixing"""
+    return render_template('remediation.html')
+ 
+ 
+@app.route('/api/remediation/suggestions')
+def get_remediation_suggestions():
+    """API endpoint to get AI-powered remediation suggestions"""
+    try:
+        if not AGENT3_AVAILABLE or remediation_service is None:
+            return jsonify({
+                'error': 'Remediation service not available',
+                'total': 0,
+                'suggestions': []
+            }), 503
+        
+        # Load data if not already loaded
+        if not remediation_service.load_data():
+            return jsonify({'error': 'Failed to load remediation data'}), 500
+       
+        # Generate suggestions
+        suggestions = remediation_service.generate_suggestions()
+       
+        return jsonify({
+            'total': len(suggestions),
+            'suggestions': suggestions
+        })
+   
+    except Exception as e:
+        print(f"❌ Error in remediation suggestions: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+ 
+ 
+@app.route('/api/remediation/execute', methods=['POST'])
+def execute_remediation():
+    """API endpoint to execute remediation action"""
+    try:
+        if not AGENT3_AVAILABLE or remediation_service is None:
+            return jsonify({
+                'status': 'error',
+                'message': 'Remediation service not available'
+            }), 503
+        
+        data = request.json
+        action_id = data.get('action_id')
+        chosen_action = data.get('chosen_action')
+       
+        result = remediation_service.execute_action(action_id, chosen_action)
+        return jsonify(result)
+   
+    except Exception as e:
+        print(f"❌ Error executing remediation: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+ 
+ 
+@app.route('/reports')
+def reports():
+    """Reports page - audit logs and downloads"""
+    try:
+        # Check for remediation logs
+        log_file = OUTPUT_DIR / "remediation_logs" / "remediation_audit_log.csv"
+        has_remediation_logs = log_file.exists()
+       
+        remediation_logs = []
+        if has_remediation_logs:
+            try:
+                log_df = pd.read_csv(log_file)
+                remediation_logs = log_df.to_dict('records')
+            except Exception as e:
+                print(f"⚠️  Error loading remediation logs: {e}")
+       
+        return render_template('reports.html',
+            has_remediation_logs=has_remediation_logs,
+            remediation_logs=remediation_logs
+        )
+    
+    except Exception as e:
+        print(f"❌ Error in reports route: {e}")
+        import traceback
+        traceback.print_exc()
+        return render_template('error.html',
+            message=f"Error loading reports: {str(e)}")
+ 
+ 
+@app.route('/api/download/<report_type>')
+def download_report(report_type):
+    """Download various reports"""
+    try:
+        if report_type == 'issues':
+            file_path = OUTPUT_DIR / "quality_issues_with_remediation.csv"
+        elif report_type == 'profiling':
+            file_path = OUTPUT_DIR / "profiling_results.json"
+        elif report_type == 'audit_log':
+            file_path = OUTPUT_DIR / "remediation_logs" / "remediation_audit_log.csv"
+        else:
+            return "Invalid report type", 400
+       
+        if not file_path.exists():
+            return "Report not found", 404
+       
+        return send_file(file_path, as_attachment=True)
+    
+    except Exception as e:
+        print(f"❌ Error downloading report: {e}")
+        return f"Error: {str(e)}", 500
+ 
+ 
+# ==================== ERROR HANDLERS ====================
+ 
+@app.errorhandler(404)
+def not_found(e):
+    return render_template('error.html', message="Page not found"), 404
+ 
+@app.errorhandler(500)
+def server_error(e):
+    return render_template('error.html', message=f"Internal server error: {str(e)}"), 500
+ 
+ 
+# ==================== MAIN ====================
+ 
+if __name__ == '__main__':
+    print("\n" + "="*60)
+    print("🚀 DATA QUALITY DASHBOARD")
+    print("="*60)
+    print(f"\n📊 Dashboard: http://localhost:5000")
+    print(f"📁 Data directory: {OUTPUT_DIR.absolute()}")
+    print(f"📁 Dataset: {DATASET_PATH.name}")
+    
+    # Check if data files exist
+    profiling_exists = (OUTPUT_DIR / "profiling_results.json").exists()
+    issues_exists = (OUTPUT_DIR / "quality_issues_with_remediation.csv").exists()
+    
+    print(f"\n📋 Data Status:")
+    print(f"  {'✓' if profiling_exists else '✗'} Profiling data")
+    print(f"  {'✓' if issues_exists else '✗'} Issues data")
+    
+    if not profiling_exists or not issues_exists:
+        print(f"\n⚠️  Missing data files! Run Agent 1 and Agent 2 first.")
+    
+    print("\nPress Ctrl+C to stop\n")
+   
+    app.run(debug=True, port=5000, host='0.0.0.0')
