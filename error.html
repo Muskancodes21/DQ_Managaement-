@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block title %}Error - DQ Dashboard{% endblock %}
+
+{% block content %}
+<div class="card" style="text-align: center; padding: 60px 20px;">
+    <h1 style="font-size: 4em; margin-bottom: 20px;">⚠️</h1>
+    <h2 style="color: #e74c3c; margin-bottom: 15px;">Error</h2>
+    <p style="font-size: 1.2em; color: #7f8c8d;">{{ message }}</p>
+    <br>
+    <a href="/" class="btn btn-primary">← Back to Dashboard</a>
+</div>
+{% endblock %}
