@@ -1,0 +1,295 @@
+{% extends "base.html" %}
+
+{% block title %}Issues Explorer - DQ Dashboard{% endblock %}
+
+{% block extra_css %}
+<style>
+    .filters {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin-bottom: 20px;
+    }
+    
+    .filter-group {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+    }
+    
+    .filter-group label {
+        font-weight: 600;
+        color: #2c3e50;
+    }
+    
+    .filter-group select,
+    .filter-group input {
+        padding: 10px;
+        border: 2px solid #e0e0e0;
+        border-radius: 5px;
+        font-size: 0.95em;
+    }
+    
+    .filter-group select:focus,
+    .filter-group input:focus {
+        outline: none;
+        border-color: #667eea;
+    }
+    
+    .issues-stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 15px;
+        margin-bottom: 20px;
+    }
+    
+    .stat-item {
+        background: white;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #667eea;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    }
+    
+    .stat-item h3 {
+        font-size: 2em;
+        color: #667eea;
+        margin-bottom: 5px;
+    }
+    
+    .stat-item p {
+        color: #7f8c8d;
+        font-size: 0.9em;
+    }
+    
+    .issues-table {
+        width: 100%;
+        margin-top: 20px;
+    }
+    
+    .issues-table th {
+        background: #667eea;
+        color: white;
+        padding: 12px;
+        text-align: left;
+        position: sticky;
+        top: 0;
+    }
+    
+    .issues-table td {
+        padding: 12px;
+        border-bottom: 1px solid #e0e0e0;
+    }
+    
+    .issues-table tbody tr:hover {
+        background: #f8f9fa;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>🔍 Issues Explorer</h1>
+    <p>Search, filter, and analyze all data quality issues</p>
+</div>
+
+<!-- Statistics -->
+<div class="issues-stats">
+    <div class="stat-item">
+        <h3 id="total-issues">-</h3>
+        <p>Total Issues</p>
+    </div>
+    <div class="stat-item" style="border-left-color: #e74c3c;">
+        <h3 id="critical-count" style="color: #e74c3c;">-</h3>
+        <p>Critical</p>
+    </div>
+    <div class="stat-item" style="border-left-color: #f39c12;">
+        <h3 id="high-count" style="color: #f39c12;">-</h3>
+        <p>High</p>
+    </div>
+    <div class="stat-item" style="border-left-color: #27ae60;">
+        <h3 id="filtered-count" style="color: #27ae60;">-</h3>
+        <p>Showing</p>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="card">
+    <h2>Filters</h2>
+    <div class="filters">
+        <div class="filter-group">
+            <label for="entity-filter">Entity</label>
+            <select id="entity-filter" onchange="applyFilters()">
+                <option value="">All Entities</option>
+                {% for entity in entities %}
+                <option value="{{ entity }}">{{ entity }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        
+        <div class="filter-group">
+            <label for="severity-filter">Severity</label>
+            <select id="severity-filter" onchange="applyFilters()">
+                <option value="">All Severities</option>
+                {% for severity in severities %}
+                <option value="{{ severity }}">{{ severity }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        
+        <div class="filter-group">
+            <label for="rule-filter">Rule Type</label>
+            <select id="rule-filter" onchange="applyFilters()">
+                <option value="">All Rules</option>
+                {% for rule in rule_types %}
+                <option value="{{ rule }}">{{ rule }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        
+        <div class="filter-group">
+            <label for="search-filter">Search</label>
+            <input type="text" id="search-filter" placeholder="Search..." onkeyup="applyFilters()">
+        </div>
+    </div>
+    
+    <div style="margin-top: 15px; display: flex; gap: 10px;">
+        <button class="btn btn-secondary" onclick="clearFilters()">Clear Filters</button>
+        <button class="btn btn-success" onclick="exportFilteredIssues()">📥 Export CSV</button>
+    </div>
+</div>
+
+<!-- Issues Table -->
+<div class="card">
+    <h2>Issues List</h2>
+    <div id="issues-container">
+        <div class="loading">Loading issues...</div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    let allIssues = [];
+    let filteredIssues = [];
+    
+    async function loadIssues() {
+        try {
+            const response = await fetch('/api/issues');
+            const data = await response.json();
+            
+            if (data.error) {
+                showError('issues-container', data.error);
+                return;
+            }
+            
+            allIssues = data.issues;
+            filteredIssues = allIssues;
+            
+            updateStatistics();
+            renderIssuesTable();
+            
+        } catch (error) {
+            showError('issues-container', 'Failed to load issues: ' + error.message);
+        }
+    }
+    
+    function applyFilters() {
+        const entityFilter = document.getElementById('entity-filter').value;
+        const severityFilter = document.getElementById('severity-filter').value;
+        const ruleFilter = document.getElementById('rule-filter').value;
+        const searchFilter = document.getElementById('search-filter').value.toLowerCase();
+        
+        filteredIssues = allIssues.filter(issue => {
+            if (entityFilter && issue.entity !== entityFilter) return false;
+            if (severityFilter && issue.severity !== severityFilter) return false;
+            if (ruleFilter && issue.rule_violated !== ruleFilter) return false;
+            if (searchFilter && !JSON.stringify(issue).toLowerCase().includes(searchFilter)) return false;
+            return true;
+        });
+        
+        document.getElementById('filtered-count').textContent = filteredIssues.length;
+        renderIssuesTable();
+    }
+    
+    function clearFilters() {
+        document.getElementById('entity-filter').value = '';
+        document.getElementById('severity-filter').value = '';
+        document.getElementById('rule-filter').value = '';
+        document.getElementById('search-filter').value = '';
+        applyFilters();
+    }
+    
+    function updateStatistics() {
+        document.getElementById('total-issues').textContent = allIssues.length;
+        document.getElementById('critical-count').textContent = 
+            allIssues.filter(i => i.severity === 'CRITICAL').length;
+        document.getElementById('high-count').textContent = 
+            allIssues.filter(i => i.severity === 'HIGH').length;
+        document.getElementById('filtered-count').textContent = filteredIssues.length;
+    }
+    
+    function renderIssuesTable() {
+        const container = document.getElementById('issues-container');
+        
+        if (filteredIssues.length === 0) {
+            container.innerHTML = '<p style="text-align: center; padding: 40px; color: #7f8c8d;">No issues found matching the filters.</p>';
+            return;
+        }
+        
+        const tableHTML = `
+            <table class="issues-table">
+                <thead>
+                    <tr>
+                        <th>Entity</th>
+                        <th>Column</th>
+                        <th>Rule Violated</th>
+                        <th>Severity</th>
+                        <th>Row Index</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${filteredIssues.map(issue => `
+                        <tr>
+                            <td><strong>${issue.entity}</strong></td>
+                            <td><code>${issue.column}</code></td>
+                            <td>${issue.rule_violated}</td>
+                            <td><span class="badge badge-${issue.severity.toLowerCase()}">${issue.severity}</span></td>
+                            <td>${issue.row_index !== null ? issue.row_index : '-'}</td>
+                            <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">${issue.value || '-'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+        
+        container.innerHTML = tableHTML;
+    }
+    
+    function exportFilteredIssues() {
+        const csvContent = [
+            ['Entity', 'Column', 'Rule Violated', 'Severity', 'Row Index', 'Value'],
+            ...filteredIssues.map(issue => [
+                issue.entity,
+                issue.column,
+                issue.rule_violated,
+                issue.severity,
+                issue.row_index || '',
+                issue.value || ''
+            ])
+        ].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+        
+        const blob = new Blob([csvContent], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `filtered_issues_${new Date().toISOString().split('T')[0]}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }
+    
+    // Load on page load
+    loadIssues();
+</script>
+{% endblock %}
