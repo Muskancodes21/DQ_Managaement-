@@ -1,0 +1,353 @@
+{% extends "base.html" %}
+
+{% block title %}Remediation - DQ Dashboard{% endblock %}
+
+{% block extra_css %}
+<style>
+    .stats-row {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 20px;
+        margin-bottom: 30px;
+    }
+    
+    .stat-box {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+    }
+    
+    .stat-box h3 {
+        font-size: 2.5em;
+        margin-bottom: 5px;
+    }
+    
+    .action-card {
+        background: white;
+        border: 2px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+        transition: all 0.3s;
+    }
+    
+    .action-card:hover {
+        border-color: #667eea;
+        box-shadow: 0 5px 15px rgba(102, 126, 234, 0.2);
+    }
+    
+    .action-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+    }
+    
+    .action-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    .action-title h3 {
+        margin: 0;
+        color: #2c3e50;
+    }
+    
+    .action-details {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 15px;
+        margin-bottom: 15px;
+        font-size: 0.95em;
+    }
+    
+    .detail-item {
+        background: #f8f9fa;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    
+    .detail-item strong {
+        color: #667eea;
+    }
+    
+    .business-impact {
+        background: #fff3cd !important;
+        border-left: 3px solid #ffc107;
+        grid-column: 1 / -1;
+    }
+    
+    .ai-recommendation {
+        background: #e8f4f8 !important;
+        border-left: 3px solid #667eea;
+        grid-column: 1 / -1;
+    }
+    
+    .action-buttons {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+    }
+    
+    .action-buttons select {
+        flex: 1;
+        padding: 10px 15px;
+        border: 2px solid #e0e0e0;
+        border-radius: 5px;
+        font-size: 0.95em;
+        min-width: 200px;
+    }
+    
+    .severity-critical, .severity-high {
+        color: #e74c3c;
+        font-weight: bold;
+    }
+    
+    .severity-medium {
+        color: #f39c12;
+        font-weight: bold;
+    }
+    
+    .severity-low {
+        color: #27ae60;
+        font-weight: bold;
+    }
+    
+    .executed-section {
+        margin-top: 40px;
+        padding-top: 40px;
+        border-top: 2px solid #e0e0e0;
+    }
+    
+    .executed-card {
+        background: #f8f9fa;
+        border-left: 4px solid #27ae60;
+        padding: 15px;
+        margin-bottom: 15px;
+        border-radius: 5px;
+    }
+    
+    .status-success {
+        border-left-color: #27ae60;
+    }
+    
+    .status-error {
+        border-left-color: #e74c3c;
+    }
+    
+    .status-skipped {
+        border-left-color: #95a5a6;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>🛠️ AI-Powered Remediation</h1>
+    <p>Review and apply intelligent data quality fixes with AI recommendations</p>
+</div>
+
+<!-- Statistics -->
+<div class="stats-row">
+    <div class="stat-box">
+        <h3 id="total-actions">-</h3>
+        <p>Total Actions</p>
+    </div>
+    <div class="stat-box">
+        <h3 id="high-severity">-</h3>
+        <p>High/Critical Priority</p>
+    </div>
+    <div class="stat-box">
+        <h3 id="ai-powered">-</h3>
+        <p>AI-Powered</p>
+    </div>
+    <div class="stat-box">
+        <h3 id="executed-count">0</h3>
+        <p>Executed</p>
+    </div>
+</div>
+
+<!-- Actions Container -->
+<div id="actions-container">
+    <div class="loading">⏳ Loading AI-powered suggestions...</div>
+</div>
+
+<!-- Executed Actions -->
+<div class="executed-section" id="executed-section" style="display: none;">
+    <div class="card">
+        <h2>✅ Executed Actions</h2>
+        <div id="executed-container"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    let actions = [];
+    let executedActions = [];
+    
+    // Load actions on page load
+    async function loadActions() {
+        try {
+            showLoading('actions-container');
+            
+            const response = await fetch('/api/remediation/suggestions');
+            const data = await response.json();
+            
+            if (data.error) {
+                showError('actions-container', data.error);
+                return;
+            }
+            
+            actions = data.suggestions || [];
+            
+            // Update statistics
+            document.getElementById('total-actions').textContent = actions.length;
+            document.getElementById('high-severity').textContent = 
+                actions.filter(a => a.severity === 'HIGH' || a.severity === 'CRITICAL').length;
+            document.getElementById('ai-powered').textContent = 
+                actions.filter(a => a.ai_powered).length;
+            
+            renderActions();
+            
+        } catch (error) {
+            showError('actions-container', 'Failed to load suggestions: ' + error.message);
+        }
+    }
+    
+    function renderActions() {
+        const container = document.getElementById('actions-container');
+        
+        if (actions.length === 0) {
+            container.innerHTML = `
+                <div class="card">
+                    <h2 style="color: #27ae60;">🎉 No Issues Found!</h2>
+                    <p>Your data quality is excellent. No remediation actions needed.</p>
+                </div>
+            `;
+            return;
+        }
+        
+        container.innerHTML = '';
+        
+        actions.forEach(action => {
+            const card = document.createElement('div');
+            card.className = 'action-card';
+            card.innerHTML = `
+                <div class="action-header">
+                    <div class="action-title">
+                        <h3>
+                            ${action.issue_type}
+                            ${action.ai_powered ? ' 🤖' : ''}
+                        </h3>
+                    </div>
+                    <span class="severity-${action.severity.toLowerCase()}">
+                        ${action.severity} Priority
+                    </span>
+                </div>
+                
+                <p style="color: #666; margin-bottom: 15px;">
+                    <strong>${action.table}.${action.column}</strong> (${action.data_type})
+                </p>
+                
+                <div class="action-details">
+                    <div class="detail-item">
+                        <strong>Issue Count:</strong> ${action.issue_count}
+                    </div>
+                    <div class="detail-item">
+                        <strong>Impact:</strong> ${action.impact}
+                    </div>
+                    ${action.business_impact ? `
+                    <div class="detail-item business-impact">
+                        <strong>⚠️ Business Impact:</strong> ${action.business_impact}
+                    </div>
+                    ` : ''}
+                    <div class="detail-item ai-recommendation">
+                        <strong>${action.ai_powered ? '🤖 AI' : '📋'} Recommended Action:</strong> ${action.suggested_action}
+                        <p style="margin-top: 5px; color: #666; font-size: 0.95em;">${action.description}</p>
+                    </div>
+                </div>
+                
+                <div class="action-buttons">
+                    <select id="action-select-${action.action_id}">
+                        <option value="${action.suggested_action}">
+                            ${action.suggested_action} ${action.ai_powered ? '(AI Recommended)' : '(Recommended)'}
+                        </option>
+                        ${action.alternative_actions.map(alt => 
+                            `<option value="${alt}">${alt}</option>`
+                        ).join('')}
+                    </select>
+                    <button class="btn btn-primary" onclick="executeAction(${action.action_id})">
+                        Execute
+                    </button>
+                </div>
+            `;
+            container.appendChild(card);
+        });
+    }
+    
+    async function executeAction(actionId) {
+        const select = document.getElementById(`action-select-${actionId}`);
+        const chosenAction = select.value;
+        
+        if (!confirm(`Are you sure you want to execute: "${chosenAction}"?`)) {
+            return;
+        }
+        
+        try {
+            const response = await fetch('/api/remediation/execute', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    action_id: actionId,
+                    chosen_action: chosenAction
+                })
+            });
+            
+            const result = await response.json();
+            
+            if (result.status === 'success' || result.status === 'skipped') {
+                alert(`✅ ${result.message}`);
+                
+                // Remove from pending actions
+                actions = actions.filter(a => a.action_id !== actionId);
+                executedActions.push({
+                    actionId: actionId,
+                    chosenAction: chosenAction,
+                    ...result
+                });
+                
+                renderActions();
+                renderExecuted();
+                
+                document.getElementById('executed-count').textContent = executedActions.length;
+                document.getElementById('executed-section').style.display = 'block';
+            } else {
+                alert(`❌ Error: ${result.message}`);
+            }
+            
+        } catch (error) {
+            alert(`❌ Failed to execute action: ${error.message}`);
+        }
+    }
+    
+    function renderExecuted() {
+        const container = document.getElementById('executed-container');
+        container.innerHTML = executedActions.map(ex => `
+            <div class="executed-card status-${ex.status}">
+                <strong>Action ${ex.actionId}:</strong> ${ex.chosenAction}<br>
+                <span style="color: #666;">${ex.message}</span>
+                ${ex.rows_affected > 0 ? `<br><strong>Rows Affected:</strong> ${ex.rows_affected}` : ''}
+                ${ex.output_file ? `<br><strong>Output:</strong> <code>${ex.output_file}</code>` : ''}
+            </div>
+        `).join('');
+    }
+    
+    // Load actions on page load
+    loadActions();
+</script>
+{% endblock %}
